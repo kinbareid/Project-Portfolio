@@ -1,0 +1,64 @@
+import requests
+import random
+from twilio.rest import Client
+import geocoder
+
+class RestaurantNotifier:
+    def __init__(self, twilio_sid, twilio_auth_token, twilio_phone_number, yelp_api_key, cell_numbers):
+        self.twilio_sid = twilio_sid
+        self.twilio_auth_token = twilio_auth_token
+        self.twilio_phone_number = twilio_phone_number
+        self.yelp_api_key = yelp_api_key
+        self.cell_numbers = cell_numbers
+        self.client = Client(self.twilio_sid, self.twilio_auth_token)
+        self.ip_location = geocoder.ip('me')
+
+    def get_restaurants(self):
+        url = f"https://api.yelp.com/v3/businesses/search?location={self.ip_location.city}"
+        headers = {
+            'Authorization': f'Bearer {self.yelp_api_key}'
+        }
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()  # Raise an exception for HTTP errors
+        return response.json().get('businesses', [])
+
+    def send_sms(self, name, rating, address, link):
+        for number in self.cell_numbers:
+            message = self.client.messages.create(
+                body=f'You are going to {name}.\nIt has a rating of {rating}.\nThe Address is {address}\n\n\n{link}',
+                to=number,
+                from_=self.twilio_phone_number
+            )
+            print(f"Message to {number} status: {message.status}")
+
+    def notify_random_restaurant(self):
+        restaurants = self.get_restaurants()
+        if not restaurants:
+            print("No restaurants found.")
+            return
+
+        chosen_restaurant = random.choice(restaurants)
+        name = chosen_restaurant['name']
+        rating = chosen_restaurant['rating']
+        link = chosen_restaurant['url']
+        address = ", ".join(chosen_restaurant['location']['display_address'])
+
+        print(f"Chosen restaurant: {name}, Rating: {rating}, Address: {address}")
+        self.send_sms(name=name, rating=rating, address=address, link=link)
+
+if __name__ == "__main__":
+    # Replace these with your actual credentials and phone numbers
+    TWILIO_SID = 'your_twilio_sid'
+    TWILIO_AUTH_TOKEN = 'your_twilio_auth_token'
+    TWILIO_PHONE_NUMBER = 'your_twilio_phone_number'
+    YELP_API_KEY = 'your_yelp_api_key'
+    CELL_NUMBERS = ['+19545990374']  # Add more numbers as needed
+
+    notifier = RestaurantNotifier(
+        twilio_sid=TWILIO_SID,
+        twilio_auth_token=TWILIO_AUTH_TOKEN,
+        twilio_phone_number=TWILIO_PHONE_NUMBER,
+        yelp_api_key=YELP_API_KEY,
+        cell_numbers=CELL_NUMBERS
+    )
+    notifier.notify_random_restaurant()
