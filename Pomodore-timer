@@ -1,0 +1,71 @@
+import math
+import time
+
+class PomodoroTimer:
+    def __init__(self, work_min=25, short_break_min=5, long_break_min=20):
+        self.PINK = "#e2979c"
+        self.RED = "#e7305b"
+        self.GREEN = "#9bdeac"
+        self.YELLOW = "#f7f5dd"
+        self.FONT_NAME = "Courier"
+        self.WORK_MIN = work_min
+        self.SHORT_BREAK_MIN = short_break_min
+        self.LONG_BREAK_MIN = long_break_min
+        self.CHECK_MARK = ''
+        self.reps = 0
+        self.timer = None
+
+    def reset_timer(self):
+        try:
+            self.reps = 0
+            self.CHECK_MARK = ''
+            print("Timer reset to 00:00")
+            self.display_check_marks()
+        except Exception as e:
+            print(f"Error resetting timer: {e}")
+
+    def start_timer(self):
+        try:
+            self.reps += 1
+            if self.reps % 8 == 0:
+                count = self.LONG_BREAK_MIN * 60
+                print("Long Break")
+            elif self.reps % 2 == 0:
+                count = self.SHORT_BREAK_MIN * 60
+                print("Short Break")
+            else:
+                count = self.WORK_MIN * 60
+                print("Work")
+            self.count_down(count)
+        except Exception as e:
+            print(f"Error starting timer: {e}")
+
+    def count_down(self, count):
+        try:
+            while count > 0:
+                count_min = math.floor(count / 60)
+                count_sec = count % 60
+                if count_sec < 10:
+                    count_sec = f'0{count_sec}'
+                print(f'{count_min}:{count_sec}')
+                time.sleep(1)
+                count -= 1
+            self.start_timer()
+            if self.reps % 2 == 0:
+                self.CHECK_MARK += '✔'
+                self.display_check_marks()
+        except Exception as e:
+            print(f"Error during countdown: {e}")
+
+    def display_check_marks(self):
+        try:
+            print(f'Check Marks: {self.CHECK_MARK}')
+        except Exception as e:
+            print(f"Error displaying check marks: {e}")
+
+if __name__ == "__main__":
+    try:
+        pomodoro_timer = PomodoroTimer()
+        pomodoro_timer.start_timer()
+    except Exception as e:
+        print(f"Error initializing Pomodoro Timer: {e}")
