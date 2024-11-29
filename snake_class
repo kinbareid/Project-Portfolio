@@ -1,0 +1,80 @@
+from turtle import Turtle
+
+STARTING_POSITIONS = [(0, 0), (-20, 0), (-40, 0)]
+MOVE_DISTANCE = 20
+UP = 90
+DOWN = 270
+LEFT = 180
+RIGHT = 0
+
+class Snake:
+    def __init__(self):
+        self.snake_1 = []
+        self.create_snake()
+        self.head = self.snake_1[0]
+
+    def create_snake(self):
+        for position in STARTING_POSITIONS:
+            self.add_segment(position)
+
+    def add_segment(self, position):
+        try:
+            new_snake = Turtle()
+            new_snake.shape("square")
+            new_snake.color("white")
+            new_snake.penup()
+            new_snake.goto(position)
+            self.snake_1.append(new_snake)
+        except Exception as e:
+            print(f"Error adding segment: {e}")
+
+    def extend(self):
+        try:
+            self.add_segment(self.snake_1[-1].position())
+        except Exception as e:
+            print(f"Error extending snake: {e}")
+
+    def move(self):
+        try:
+            for i in range(len(self.snake_1) - 1, 0, -1):
+                new_x = self.snake_1[i - 1].xcor()
+                new_y = self.snake_1[i - 1].ycor()
+                self.snake_1[i].goto(new_x, new_y)
+            self.snake_1[0].forward(MOVE_DISTANCE)
+        except Exception as e:
+            print(f"Error moving snake: {e}")
+
+    def up(self):
+        try:
+            if self.head.heading() != DOWN:
+                self.head.setheading(UP)
+        except Exception as e:
+            print(f"Error changing direction to up: {e}")
+
+    def down(self):
+        try:
+            if self.head.heading() != UP:
+                self.head.setheading(DOWN)
+        except Exception as e:
+            print(f"Error changing direction to down: {e}")
+
+    def left(self):
+        try:
+            if self.head.heading() != RIGHT:
+                self.head.setheading(LEFT)
+        except Exception as e:
+            print(f"Error changing direction to left: {e}")
+
+    def right(self):
+        try:
+            if self.head.heading() != LEFT:
+                self.head.setheading(RIGHT)
+        except Exception as e:
+            print(f"Error changing direction to right: {e}")
+
+if __name__ == "__main__":
+    try:
+        snake = Snake()
+        snake.move()
+    except Exception as e:
+        print(f"Error initializing Snake class: {e}")
