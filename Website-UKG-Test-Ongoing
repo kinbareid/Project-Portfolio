@@ -1,0 +1,261 @@
+import base64
+import csv
+import tkinter as tk
+import sys
+import pyodbc as odbc
+import os
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.common.exceptions import NoSuchElementException
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.keys import Keys
+from tkinter import messagebox
+import time
+import getpass
+
+class WebServerHealthCheck:
+    def __init__(self):
+        self.username = getpass.getuser()
+        self.file_path = f'C:/Users/{self.username}/Desktop'
+        self.driver = self.init_driver()
+        self.create_gui()
+
+    def init_driver(self):
+        chrome_path = 'C:/Users/alejandro.palacio/chromedriver.exe'
+        options = Options()
+        options.add_argument("--disable-popup-blocking")
+        return webdriver.Chrome(executable_path=chrome_path, options=options)
+
+    def create_file(self):
+        with open(f'{self.file_path}/output.csv', 'w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['server', 'results'])
+
+    def write_to_file(self, server, result):
+        with open(f'{self.file_path}/output.csv', 'a', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow([server, result])
+
+    def remove_file(self):
+        if os.path.isfile(f'{self.file_path}/output.csv'):
+            os.remove(f'{self.file_path}/output.csv')
+
+    def run_sql(self, env):
+        if 'D' in env:
+            env += '%'
+        sql_query = f"""
+        SELECT server_name
+        FROM inv.server WITH (NOLOCK)
+        WHERE pod+site+client_code LIKE '{env}'
+        AND inventory_status_id = 1
+        AND server_function = 'Web Server'
+        AND product = 'Ultipro'
+        AND server_name NOT LIKE '%98%'
+        AND server_name NOT LIKE '%99%'
+        """
+        connection_string = (
+            r'DRIVER={ODBC Driver 13 for SQL Server};'
+            r'SERVER=E0IDWHDB01;'
+            r'DATABASE=InfraWH;'
+            r'Trusted_Connection=yes;'
+        )
+        with odbc.connect(connection_string) as conn:
+            cursor = conn.cursor()
+            cursor.execute(sql_query)
+            return cursor.fetchall()
+
+    def remove_spec_characters(self, server):
+        return ''.join(c for c in server if c.isalnum())
+
+    def screenshot(self, x):
+        self.driver.save_screenshot(f'{self.file_path}/screenshot{x}.png')
+
+    def check_web_server_login(self, name, app):
+        name = name.lower()
+        site = f'https://{name}:9090/login.aspx'
+        try:
+            self.driver.get(site)
+        except Exception:
+            self.write_to_file(name, "fail, unable to hit Site")
+            self.screenshot(1)
+            return
+
+        try:
+            self.driver.find_element(By.ID, "details-button").click()
+            self.driver.find_element(By.ID, "proceed-link").click()
+        except NoSuchElementException:
+            pass
+
+        try:
+            login = self.driver.find_element(By.ID, "ctl00_Content_Login1_UserName")
+            login.send_keys(self.entry_user.get())
+        except NoSuchElementException:
+            self.write_to_file(name, "fail, no such element at ctl00_Content_Login1_UserName")
+            self.screenshot(2)
+            return
+
+        try:
+            pw = self.driver.find_element(By.ID, "ctl00_Content_Login1_Password")
+            pw.send_keys(self.entry_pw.get())
+        except NoSuchElementException:
+            self.write_to_file(name, "fail, no such element ctl00_Content_Login1_Password")
+            self.screenshot(3)
+            return
+
+        try:
+            self.driver.find_element(By.NAME, "ctl00$Content$Login1$LoginButton").click()
+        except NoSuchElementException:
+            self.write_to_file(name, "fail, no such element ctl00$Content$Login1$LoginButton")
+            self.screenshot(4)
+            return
+
+        try:
+            self.driver.find_element(By.ID, "ctl00_Content_warnMsg")
+            self.write_to_file(name, "fail, Bad username/password combo")
+            messagebox.showinfo('information', 'finished check csv file')
+            self.screenshot(5)
+            sys.exit(1)
+        except NoSuchElementException:
+            pass
+
+        try:
+            self.driver.find_element(By.ID, "nav-menu-button").click()
+        except NoSuchElementException:
+            if self.login_test(name):
+                pass
+            else:
+                self.write_to_file(name, "fail, no such element nav-menu-button")
+                self.screenshot(6)
+
+        if app == 'BI':
+            self.bi_test(name)
+        elif app == 'UTM':
+            self.utm_test(name)
+        elif app == 'WFR':
+            pass
+        elif app == 'UTA':
+            self.uta_test(name)
+        elif app == 'ONB':
+            pass
+        elif app == 'REC':
+            pass
+        else:
+            self.login_test(name)
+
+    def login_test(self, name):
+        try:
+            self.driver.find_element(By.ID, "link_home")
+            self.write_to_file(name, "pass")
+            return True
+        except NoSuchElementException:
+            self.write_to_file(name, "fail")
+            self.screenshot(7)
+            return False
+
+    def bi_test(self, name):
+        try:
+            time.sleep(5)
+            self.driver.find_element(By.ID, "menu_admin").click()
+        except NoSuchElementException:
+            self.write_to_file(name, "fail, no such element menu_admin")
+            self.screenshot(8)
+            return
+
+        try:
+            self.driver.find_element(By.XPATH, '//*[@id="2137"]/div/ukg-nav-item').click()
+            time.sleep(10)
+        except NoSuchElementException:
+            self.write_to_file(name, 'fail, no such element Business Intelligence, //*[@id="2137"]/div/ukg-nav-item')
+            self.screenshot(9)
+            return
+
+        try:
+            element = self.driver.find_element(By.CSS_SELECTOR, "[data-id='1932']")
+            element.send_keys(Keys.CONTROL + Keys.RETURN)
+        except NoSuchElementException:
+            self.write_to_file(name, 'fail, no such element Business Intelligence, //*[@id="1932"]')
+            self.screenshot(10)
+
+    def utm_test(self, name):
+        try:
+            time.sleep(5)
+            self.driver.find_element(By.ID, "menu_myself").click()
+        except NoSuchElementException:
+            self.write_to_file(name, "fail, no such element menu_my_team")
+            self.screenshot(11)
+            return
+
+        try:
+            self.driver.find_element(By.XPATH, '//*[@id="2148"]').click()
+            time.sleep(20)
+        except NoSuchElementException:
+            self.write_to_file(name, 'fail, no such element UTM, //*[@id="2148"]')
+            self.screenshot(12)
+
+    def uta_test(self, name):
+        try:
+            time.sleep(5)
+            self.driver.find_element(By.ID, "menu_my_team").click()
+        except NoSuchElementException:
+            self.write_to_file(name, "fail, no such element menu_my_team")
+            self.screenshot(13)
+            return
+
+        try:
+            self.driver.find_element(By.XPATH, '//*[@id="1411"]').click()
+            time.sleep(20)
+        except NoSuchElementException:
+            self.write_to_file(name, 'fail, no such element UTA, //*[@id="1411"]')
+            self.screenshot(14)
+            return
+
+        self.driver.switch_to.window(self.driver.window_handles[1])
+        try:
+            self.driver.find_element(By.XPATH, '//*[@id="wfmHeaderMenuBarTicker"]/li[2]/a')
+            self.write_to_file(name, "Uta pass")
+        except NoSuchElementException:
+            self.write_to_file(name, "Uta fail")
+            self.screenshot(15)
+        self.driver.close()
+        self.driver.switch_to.window(self.driver.window_handles[0])
+
+    def run_gui(self, app, web_list):
+        for i, server in enumerate(web_list):
+            name = self.remove_spec_characters(server)
+            self.check_web_server_login(name, app)
+            if i == len(web_list) - 1:
+                messagebox.showinfo('information', 'finished check csv file')
+                sys.exit()
+
+    def initial_steps(self):
+        self.remove_file()
+        env = self.entry.get().strip()
+        web_server_list = self.run_sql(env)
+        self.create_file()
+        return web_server_list
+
+    def login_only(self):
+        web_server_list = self.initial_steps()
+        self.run_gui(app='login', web_list=web_server_list)
+
+    def bi(self):
+        web_server_list = self.initial_steps()
+        self.run_gui(app='bi', web_list=web_server_list)
+
+    def utm(self):
+        web_server_list = self.initial_steps()
+        self.run_gui(app='UTM', web_list=web_server_list)
+
+    def wfr(self):
+        web_server_list = self.initial_steps()
+        self.run_gui(app='WFR', web_list=web_server_list)
+
+    def uta(self):
+        web_server_list = self.initial_steps()
+        self.run_gui(app='UTA', web_list=web_server_list)
+
+    def create_gui(self):
+        root = tk.Tk()
+        root.title("Web server Health check")
+        root.config(width=100, height=100, padx=10, pady= 10
+
