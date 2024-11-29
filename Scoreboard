@@ -1,0 +1,41 @@
+from turtle import Turtle
+
+class Scoreboard(Turtle):
+    def __init__(self):
+        super().__init__()
+        self.hideturtle()
+        self.penup()
+        self.color("white")
+        self.setposition(0, 260)
+        self.score = 0
+        self.display_score()
+
+    def display_score(self):
+        try:
+            self.clear()
+            self.write(f"Score: {self.score}", align="center", font=('Arial', 20, 'normal'))
+        except Exception as e:
+            print(f"Error displaying score: {e}")
+
+    def game_over(self):
+        try:
+            self.goto(0, 0)
+            self.write("GAME OVER", align="center", font=('Arial', 60, 'normal'))
+        except Exception as e:
+            print(f"Error displaying game over message: {e}")
+
+    def update_score(self):
+        try:
+            self.score += 1
+            self.setposition(0, 260)
+            self.display_score()
+        except Exception as e:
+            print(f"Error updating score: {e}")
+
+if __name__ == "__main__":
+    try:
+        scoreboard = Scoreboard()
+        scoreboard.update_score()
+        scoreboard.game_over()
+    except Exception as e:
+        print(f"Error initializing Scoreboard class: {e}")
