@@ -1,0 +1,95 @@
+from turtle import Screen
+import time
+from snake_class import Snake
+from food import Food
+from scoreboard import Scoreboard
+
+class SnakeGame:
+    def __init__(self):
+        self.screen = Screen()
+        self.screen.setup(width=600, height=600)
+        self.screen.bgcolor("black")
+        self.screen.title("My Snake Game")
+        self.screen.tracer(0)
+
+        self.snake = Snake()
+        self.food = Food()
+        self.scoreboard = Scoreboard()
+
+        self.screen.listen()
+        self.screen.onkey(self.snake.up, "Up")
+        self.screen.onkey(self.snake.down, "Down")
+        self.screen.onkey(self.snake.left, "Left")
+        self.screen.onkey(self.snake.right, "Right")
+
+    def play_game(self):
+        game_is_on = True
+        while game_is_on:
+            try:
+                self.screen.update()
+                time.sleep(0.1)
+                self.snake.move()
+
+                # Detect collision with food
+                if self.snake.head.distance(self.food) < 15:
+                    self.food.refresh()
+                    self.snake.extend()
+                    self.scoreboard.update_score()
+
+                # Detect collision with wall
+                if self.snake.head.xcor() > 295 or self.snake.head.xcor() < -295 or self.snake.head.ycor() > 295 or self.snake.head.ycor() < -295:
+                    game_is_on = False
+                    self.scoreboard.game_over()
+                    self.prompt_play_again()
+
+                # Detect collision with tail
+                for segment in self.snake.snake_1[1:]:
+                    if self.snake.head.distance(segment) < 10:
+                        game_is_on = False
+                        self.scoreboard.game_over()
+                        self.prompt_play_again()
+            except Exception as e:
+                print(f"Error during game loop: {e}")
+        self.screen.exitonclick()
+
+    def prompt_play_again(self):
+        try:
+            play_again = self.screen.textinput(title="Snake", prompt="Do you want to play again? 'Y' or 'N'").lower()
+            if play_again == 'y':
+                self.screen.clear()
+                self.__init__()
+                self.play_game()
+            else:
+                self.screen.bye()
+        except Exception as e:
+            print(f"Error prompting play again: {e}")
+
+if __name__ == "__main__":
+    try:
+        intro_screen = Screen()
+        intro_screen.setup(height=0, width=0)
+        intro_screen.bgcolor("black")
+        user_select = intro_screen.textinput(title="Snake", prompt="Do you want to play the snake game? 'Y' or 'N'").lower()
+        if user_select == 'y':
+            game = SnakeGame()
+            game.play_game()
+        else:
+            intro_screen.bye()
+    except Exception as e:
+        print(f"Error initializing game: {e}")
+Key Improvements:
+Object-Oriented Programming (OOP): Encapsulated functionality within the SnakeGame class.
+Security: Removed unnecessary global variables and added error handling.
+Scalability: The class can be easily extended with additional methods or modified for different game settings.
+Readability: Improved variable names, added comments, and structured the code for better readability.
+Error Handling: Added try and except blocks to handle potential errors gracefully.
+This script now focuses on the core functionality of the Snake game, making it more secure, scalable, and easier to maintain while handling errors effectively.
+
+
+Edit in Pages
+
+
+8 of 30 responses
+AI-generated content may be incorrect
+
+
