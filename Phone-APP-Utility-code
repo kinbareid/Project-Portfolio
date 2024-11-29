@@ -1,0 +1,1042 @@
+from flask import Flask, request, session, make_response, render_template
+from flask_login import LoginManager, UserMixin, login_user, login_required
+from flask_socketio import SocketIO, send, emit
+from db import get_db_connection
+from mapping import tables
+from RSAcrypt import cipher_to_string
+import time
+import hashlib
+import re
+from PlayAPI import validatePlayIntegrityToken
+
+app = Flask(__name__)
+app.secret_key = open("./sk").read()
+login_manager = LoginManager(app)
+login_manager.session_protection = "strong"
+timeoutSeconds = 60*60*12 # 45 min 
+
+# Socket Definitions
+# Error handler
+@app.errorhandler(Exception)
+def handle_exception(e):
+    return jsonify(error=str(e)), 500
+
+# Utility functions
+def hash_username(username):
+    hasher = hashlib.sha256()
+    hasher.update(username.encode('utf-8'))
+    return hasher.hexdigest()
+
+def get_user_from_db(username_hash):
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT username FROM public.users WHERE id=%s;', (username_hash,))
+            res = cur.fetchone()
+    return res
+
+def validate_password(stored_password, provided_password):
+    return cipher_to_string(stored_password) == cipher_to_string(provided_password)
+
+
+# Flask Login Configuration Functions and Models
+class User(UserMixin):
+    def __init__(self, username):
+        self.username = username
+
+    @staticmethod
+    def get(username):
+        user_hash = hash_username(username)
+
+        query = "SELECT username FROM public.users WHERE id = %s;"
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (user_hash,))
+                res = cur.fetchone()
+
+        if res:
+            return User(res[0])
+        else:
+            return None
+
+    @staticmethod
+    def attempt_login(coded_username, coded_pw, play_token, nonce, platform, instance_id):
+        if platform == 'android' and not validatePlayIntegrityToken(play_token, nonce):
+            print("invalid integrity")
+            return None, True, False, False
+        elif platform != 'ios':
+            return None, True, False, False
+
+        username = cipher_to_string(coded_username)
+        username_hash = hash_username(username)
+
+        query_user = "SELECT password FROM public.users WHERE id = %s;"
+        query_fcm_token = """
+            SELECT fcm_token, token_age
+            FROM public.fcm_tokens
+            WHERE usernamehash = %s AND app_instanceid = %s;
+        """
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query_user, (username_hash,))
+                result = cur.fetchone()
+
+                if not result:
+                    return None, False, False, False
+
+                password = cipher_to_string(coded_pw)
+                db_pw = cipher_to_string(result[0])
+
+                if password != db_pw:
+                    print("wrong password")
+                    return None, True, False, False
+
+                cur.execute(query_fcm_token, (username_hash, instance_id))
+                token_result = cur.fetchone()
+
+        if not token_result or not token_result[0]:
+            return User(username), True, True, True
+        return User(username), True, True, False
+
+    def get_id(self):
+        return self.username
+
+
+@app.route('/login', methods=['POST'])
+def login():
+    try:
+        # Get encrypted login credentials
+        coded_username = request.headers.get('username')
+        coded_pw = request.headers.get('password')
+        play_token = request.headers.get('playToken')
+        nonce = request.headers.get('nonce')
+        platform = request.headers.get('platform')
+        instance_id = request.headers.get('instanceID')
+
+        # Attempt login
+        valid_user, try_again, worked, new_fcm_token = User.attempt_login(coded_username, coded_pw, play_token, nonce, platform, instance_id)
+
+        # Continue accordingly
+        if worked:
+            session['username'] = valid_user.username
+            session['last_login'] = time.time()  # GMT epoch time in seconds since 1970
+            login_user(valid_user)
+            response = make_response("Login successful.")
+            if new_fcm_token:
+                response.headers["new_fcm_token"] = True
+            return response
+        elif try_again:
+            return "Try Again", 401  # Password wrong, but username right
+        else:
+            return "Login failed.", 401
+    except Exception as e:
+        return handle_exception(e)
+
+
+@app.route('/checkLogin', methods=['GET'])
+@login_required
+def check_login():
+    try:
+        # Get token and nonce
+        play_token = request.headers.get('playToken')
+        nonce = request.headers.get('nonce')
+
+        if validatePlayIntegrityToken(play_token, nonce):
+            return "Login successful."
+        else:
+            return "Login failed.", 401
+    except Exception as e:
+        return handle_exception(e)
+    
+    
+@app.route('/changePassword', methods=['POST'])
+@login_required
+def change_password():
+    try:
+        old_pass = request.headers.get('oldPassword')
+        new_pass = request.headers.get('newPassword')
+
+        # Hash username
+        username_hash = hash_username(session['username'])
+
+        # Test user existence / get encrypted password if yes
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute('SELECT password FROM public.users WHERE id=%s;', (username_hash,))
+                db_epw = cur.fetchone()
+
+        # No password -> username does not exist in table
+        if db_epw is None:
+            return "User not Found", 404
+        db_epw = db_epw[0]
+
+        # Decode both PW values
+        curr_password = cipher_to_string(old_pass)
+        db_pw = cipher_to_string(db_epw)
+
+        # Test password
+        if curr_password == db_pw:
+            # Simple (redundant) test for newPass
+            try:
+                # Make sure newPass can decode
+                test = cipher_to_string(new_pass)
+
+                if re.match("^[a-zA-Z\\d]{0,32}$", test):
+                    # Continue if it can
+                    # Change password
+                    with get_db_connection() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute('UPDATE public.users SET password=%s WHERE id=%s;', (new_pass, username_hash))
+                            conn.commit()
+                    return "Change successful"
+                else:
+                    return "Invalid New Password", 400
+            except Exception:
+                return "Invalid New Password", 400
+        else:
+            return "Incorrect Password", 401
+    except Exception as e:
+        return handle_exception(e)
+
+@app.route("/", methods=['GET'])
+@login_required
+def get_parcels():
+    try:
+        x1 = request.args.get("lat1", default=None, type=float)
+        x2 = request.args.get("lat2", default=None, type=float)
+        y1 = request.args.get("long1", default=None, type=float)
+        y2 = request.args.get("long2", default=None, type=float)
+
+        if x1 and x2 and y1 and y2 and abs(x2 - x1) < .1 and abs(y2 - y1) < .1:
+            polygon = f"POLYGON(({y1} {x1}, {y1} {x2}, {y2} {x2}, {y2} {x1}, {y1} {x1}))"
+            fstart_time = time.time()
+
+            with get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT name_of_table FROM public.table_of_tables WHERE ST_Intersects(shape, ST_GeomFromText(%s, 4326));", (polygon,))
+                    tables = cur.fetchall()
+                    parcels = {}
+                    num_parcels = 0
+
+                    for table in tables:
+                        cur.execute(f"SELECT DISTINCT ON (cchshape) objectid, cchshapetext FROM public.{table[0]} WHERE ST_Intersects(cchshape, ST_GeomFromText(%s, 4326)) LIMIT 501;", (polygon,))
+                        parcels[table[0]] = cur.fetchall()
+                        num_parcels += len(parcels[table[0]])
+
+                    if num_parcels >= 501:
+                        return "TOO MANY PARCELS", 400
+
+            p = ""
+            for state in parcels:
+                for j in parcels[state]:
+                    p += f"{j[0]}^{j[1]}^{state}|"
+
+            with open("./errorLog", "w") as error_log:
+                error_log.write(f"Database open to close time seconds: {time.time() - fstart_time}\n{polygon}\n{num_parcels}\n")
+
+            return p
+        else:
+            # Default scenario used to test this function
+            with get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute('SELECT objectid, ST_AsText(ST_Transform(ST_GeometryN(shape, 1), 4326)) FROM public.florida WHERE objectid=4787083;')
+                    parcel = cur.fetchall()
+
+            p = ""
+            for i in parcel:
+                p += f"{i[0]}^{i[1]}^parcels_2020|"
+            return p
+    except Exception as e:
+        return handle_exception(e)
+    
+@app.route("/getTracts", methods=['GET'])
+@login_required
+def get_tracts():
+    try:
+        x1 = request.args.get("lat1", default=None, type=float)
+        x2 = request.args.get("lat2", default=None, type=float)
+        y1 = request.args.get("long1", default=None, type=float)
+        y2 = request.args.get("long2", default=None, type=float)
+        exclude = request.headers.get('exclude')
+        shading = request.headers.get('shading')
+
+        # Validate coordinates
+        if not (x1 and x2 and y1 and y2 and abs(x2 - x1) < .1 and abs(y2 - y1) < .1):
+            return "Invalid coordinates", 400
+
+        polygon = f"POLYGON(({y1} {x1}, {y1} {x2}, {y2} {x2}, {y2} {x1}, {y1} {x1}))"
+
+        if shading == "None":
+            query = """
+                SELECT DISTINCT ON (geoid) geoid, ST_AsText(geom)
+                FROM public.censustracts
+                WHERE ST_Intersects(geom, ST_GeomFromText(%s, 4326))
+            """
+            params = [polygon]
+
+            if re.match(r"^'\d{11}'(?:,'\d{11}')*$", exclude):
+                query += " AND geoid NOT IN (%s) LIMIT 101;"
+                params.append(exclude)
+            else:
+                query += " LIMIT 151;"
+
+            with get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(query, params)
+                    tracts = cur.fetchall()
+
+            if len(tracts) > 100:
+                return "TOO MANY TRACTS", 400
+
+            result = "|".join([f"{i[0]}^{i[1]}" for i in tracts])
+            return result
+        else:
+            col_mapper = {
+                "Avg HH Inc": "income_percentile_statewide",
+                "Internet Cov.": "bbcoverage_percentile_nationwide",
+                "Pop. Density": "popdensity_percentile_statewide"
+            }
+
+            col_name = col_mapper.get(shading, "")
+            if not col_name:
+                return "Invalid shading option", 400
+
+            query = f"""
+                SELECT DISTINCT ON (geoid) geoid, ST_AsText(geom), {col_name}
+                FROM public.censustracts
+                WHERE ST_Intersects(geom, ST_GeomFromText(%s, 4326))
+            """
+            params = [polygon]
+
+            if re.match(r"^'\d{11}'(?:,'\d{11}')*$", exclude):
+                query += " AND geoid NOT IN (%s) LIMIT 101;"
+                params.append(exclude)
+            else:
+                query += " LIMIT 151;"
+
+            with get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(query, params)
+                    tracts = cur.fetchall()
+
+            if len(tracts) > 100:
+                return "TOO MANY TRACTS", 400
+
+            result = "|".join([f"{i[0]}^{i[1]}^{i[2]}" for i in tracts])
+            return result
+    except Exception as e:
+        return handle_exception(e)
+
+@app.route("/tract", methods=['GET'])
+@login_required
+def get_tract_data():
+    try:
+        id = request.args.get("id", default=None, type=str)
+        datapoints = [point.strip() for point in request.headers.get('datapoints', '').split(',')]
+
+        if not id:
+            return "ID is required", 400
+
+        if not datapoints:
+            return "Datapoints are required", 400
+
+        query = f"SELECT {', '.join(datapoints)} FROM public.tractdatapoints WHERE geoid=%s"
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (id,))
+                tract = cur.fetchone()
+
+        if not tract:
+            return "No data found", 404
+
+        result = "|".join([str(value) for value in tract])
+        return result
+    except Exception as e:
+        return handle_exception(e)
+
+@app.route("/getCounties", methods=['GET'])
+@login_required
+def get_counties():
+    try:
+        x1 = request.args.get("lat1", default=None, type=float)
+        x2 = request.args.get("lat2", default=None, type=float)
+        y1 = request.args.get("long1", default=None, type=float)
+        y2 = request.args.get("long2", default=None, type=float)
+        exclude = request.headers.get('exclude')
+
+        # Validate coordinates
+        if not (x1 and x2 and y1 and y2 and abs(x2 - x1) < .1 and abs(y2 - y1) < .1):
+            return "Invalid coordinates", 400
+
+        polygon = f"POLYGON(({y1} {x1}, {y1} {x2}, {y2} {x2}, {y2} {x1}, {y1} {x1}))"
+
+        query = """
+            SELECT DISTINCT ON (geoid) geoid, ST_AsText(geom)
+            FROM public.censuscounties
+            WHERE ST_Intersects(geom, ST_GeomFromText(%s, 4326))
+        """
+        params = [polygon]
+
+        if re.match(r"^'\d{11}'(?:,'\d{11}')*$", exclude):
+            query += " AND geoid NOT IN (%s) LIMIT 21;"
+            params.append(exclude)
+        else:
+            query += " LIMIT 51;"
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                counties = cur.fetchall()
+
+        if len(counties) > 20:
+            return "TOO MANY COUNTIES", 400
+
+        result = "|".join([f"{i[0]}^{i[1]}" for i in counties])
+        return result
+    except Exception as e:
+        return handle_exception(e)
+
+@app.route("/county", methods=['GET'])
+@login_required
+def get_county_data():
+    try:
+        id = request.args.get("id", default=None, type=str)
+        datapoints = [point.strip() for point in request.headers.get('datapoints', '').split(',')]
+
+        if not id:
+            return "ID is required", 400
+
+        if not datapoints:
+            return "Datapoints are required", 400
+
+        query = f"SELECT {', '.join(datapoints)} FROM public.countydatapoints WHERE geoid=%s"
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (id,))
+                county = cur.fetchone()
+
+        if not county:
+            return "No data found", 404
+
+        result = "|".join([str(value) for value in county])
+        return result
+    except Exception as e:
+        return handle_exception(e)
+    
+
+@app.route("/parcel", methods=['GET'])
+@login_required
+def get_parcel_data():
+    try:
+        id = request.args.get("id", default=None, type=int)
+        table = request.args.get("table", default=None, type=str)
+
+        if not id or not table:
+            return "ID and table are required", 400
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                # Fetch column names excluding specific columns
+                cur.execute("""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name=%s 
+                    AND column_name NOT IN ('shape', 'cchshape', 'cchshapetext') 
+                    ORDER BY ordinal_position;
+                """, (table,))
+                columns = cur.fetchall()
+
+                # Fetch parcel data
+                cur.execute(f"SELECT * FROM public.{table} WHERE objectid=%s", (id,))
+                parcels = cur.fetchall()
+
+        if not parcels:
+            return "No data found", 404
+
+        p = ""
+        for i in range(len(columns)):
+            column = str(columns[i][0])
+            attribute = str(parcels[0][i])
+            if attribute != "None":
+                if table in tables:
+                    if column in tables[table] and len(attribute) > 0:
+                        p += f"{tables[table][column]}^{attribute}|"
+                else:
+                    p += f"{column}^{attribute}|"
+        return p
+    except Exception as e:
+        return handle_exception(e)
+
+
+@app.route("/getOneParcel", methods=['GET'])
+@login_required
+def get_one_parcel_for_favorites():
+    try:
+        id = request.args.get("id", default=None, type=int)
+        table = request.args.get("table", default=None, type=str)
+
+        if not id or not table:
+            return "ID and table are required", 400
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT objectid, cchshapetext FROM public.{table} WHERE objectid=%s;", (id,))
+                parcel = cur.fetchall()
+
+        if not parcel:
+            return "No data found", 404
+
+        result = "^".join([str(parcel[0][0]), parcel[0][1], table])
+        return result
+    except Exception as e:
+        return handle_exception(e)
+
+@app.route("/parcelLatLong", methods=['GET'])
+@login_required
+def get_parcel_data_lat_long():
+    try:
+        lat = request.args.get("lat", default=None, type=float)
+        long = request.args.get("long", default=None, type=float)
+
+        if not lat or not long:
+            return "Latitude and longitude are required", 400
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute('SELECT name_of_table FROM public.table_of_tables;')
+                tables = cur.fetchall()
+
+                parcel = None
+                columns = None
+                for table in tables:
+                    cur.execute(f'SELECT ST_SRID(shape) FROM public.{table[0]} LIMIT 1;')
+                    srid = cur.fetchone()[0]
+
+                    cur.execute("""
+                        SELECT column_name 
+                        FROM information_schema.columns 
+                        WHERE table_name=%s 
+                        ORDER BY ordinal_position;
+                    """, (table[0],))
+                    columns = cur.fetchall()
+
+                    cur.execute("""
+                        SELECT * 
+                        FROM public.{table} 
+                        WHERE ST_Intersects(shape, ST_Transform(ST_GeomFromText('POINT(%s %s)', 4326), %s));
+                    """, (long, lat, srid))
+                    parcel = cur.fetchall()
+
+                    if parcel:
+                        break
+
+        if not parcel:
+            return "No data found", 404
+
+        p = "|".join([f"{columns[i][0]}^{parcel[0][i]}" for i in range(len(parcel[0]) - 1)])
+        return p
+    except Exception as e:
+        return handle_exception(e)
+
+
+@app.route("/sites", methods=['GET'])
+@login_required
+def get_sites():
+    try:
+        secret = request.args.get("secret", default=None, type=int)
+        if not secret or secret != 444289292:
+            return "Invalid secret", 403
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT latitude, longitude FROM sba_sites;")
+                towers = cur.fetchall()
+
+        if not towers:
+            return "No data found", 404
+
+        result = "|".join([f"{tower[0]}^{tower[1]}" for tower in towers])
+        return result
+    except Exception as e:
+        return handle_exception(e)
+
+@app.route("/hurricanes", methods=['GET'])
+@login_required
+def get_hurricanes():
+    try:
+        year = request.args.get("year", default=None, type=int)
+        if not year:
+            return "Year is required", 400
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT ST_AsText(wkb_geometry)
+                    FROM hurricanes
+                    WHERE year = %s;
+                """, (year,))
+                hurricanes = cur.fetchall()
+
+        if not hurricanes:
+            return "No data found", 404
+
+        result = "|".join([hurricane[0] for hurricane in hurricanes])
+        return result
+    except Exception as e:
+        return handle_exception(e)
+
+
+@app.route("/hurricaneBound", methods=['GET'])
+@login_required
+def get_hurricane_bound():
+    try:
+        x1 = request.args.get("lat1", default=None, type=float)
+        x2 = request.args.get("lat2", default=None, type=float)
+        y1 = request.args.get("long1", default=None, type=float)
+        y2 = request.args.get("long2", default=None, type=float)
+        year = request.args.get("year", default=None, type=int)
+
+        if not (x1 and x2 and y1 and y2):
+            return "All coordinates are required", 400
+
+        polygon = f"POLYGON(({y1} {x1}, {y1} {x2}, {y2} {x2}, {y2} {x1}, {y1} {x1}))"
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT ogc_fid, ST_AsText(wkb_geometry)
+                    FROM hurricanes
+                    WHERE year = %s AND ST_Intersects(wkb_geometry, ST_GeomFromText(%s, 4326));
+                """, (year, polygon))
+                hurricanes = cur.fetchall()
+
+        if not hurricanes:
+            return "No data found", 404
+
+        result = "|".join([f"{hurricane[0]}^{hurricane[1]}" for hurricane in hurricanes])
+        return result
+    except Exception as e:
+        return handle_exception(e)
+
+@app.route("/hurricanePathsBound", methods=['GET'])
+@login_required
+def get_hurricane_paths_bound():
+    try:
+        x1 = request.args.get("lat1", default=None, type=float)
+        x2 = request.args.get("lat2", default=None, type=float)
+        y1 = request.args.get("long1", default=None, type=float)
+        y2 = request.args.get("long2", default=None, type=float)
+        year = request.args.get("year", default=None, type=int)
+
+        if not (x1 and x2 and y1 and y2 and year):
+            return "Invalid parameters", 400
+
+        polygon = f"POLYGON(({y1} {x1}, {y1} {x2}, {y2} {x2}, {y2} {x1}, {y1} {x1}))"
+
+        query = """
+            SELECT DISTINCT ON (sid) season, number, basin, name, ST_AsText(shape)
+            FROM hurricane_paths
+            WHERE season = %s AND ST_Intersects(shape, ST_GeomFromText(%s, 4326));
+        """
+        params = (year, polygon)
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                hurricanes = cur.fetchall()
+
+        if not hurricanes:
+            return "No data found", 404
+
+        result = "|".join([f"{h[0]},{h[1]},{h[2]},{h[3]}^{h[4]}" for h in hurricanes])
+        return result
+
+    except Exception as e:
+        return handle_exception(e)
+
+@app.route("/hurricaneHistoryBasedOnParcel", methods=['GET'])
+@login_required
+def get_hurricane_history_based_on_parcel():
+    try:
+        lat = request.args.get("lat1", default=None, type=float)
+        long = request.args.get("long1", default=None, type=float)
+
+        if lat is None or long is None:
+            return "Latitude and Longitude are required", 400
+
+        query = """
+            SELECT DISTINCT ON (sid) season, number, basin, name
+            FROM hurricanes
+            WHERE (ABS(lat - %s) < 3) AND (ABS(lon - %s) < 2) AND name != 'NOT_NAMED'
+            ORDER BY sid ASC;
+        """
+        params = (lat, long)
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                hurricanes = cur.fetchall()
+
+        if not hurricanes:
+            return "No data found", 404
+
+        result = "|".join([f"{h[0]},{h[1]},{h[2]}^{h[3]}" for h in hurricanes])
+        return result
+
+    except Exception as e:
+        return handle_exception(e)
+
+@app.route("/tornadoHistoryBasedOnParcel", methods=['GET'])
+@login_required
+def get_tornado_history_based_on_parcel():
+    try:
+        lat = request.args.get("lat1", default=None, type=float)
+        long = request.args.get("long1", default=None, type=float)
+
+        if lat is None or long is None:
+            app.logger.error("Latitude or Longitude is missing")
+            return "Latitude or Longitude is missing", 400
+
+        query = """
+            SELECT DISTINCT ON (yr, mo, dy) yr, mo, dy, mag, inj, fat, loss
+            FROM tornado_data
+            WHERE %s BETWEEN LEAST(slat, elat) AND GREATEST(slat, elat)
+            AND %s BETWEEN LEAST(slon, elon) AND GREATEST(slon, elon)
+            ORDER BY yr ASC;
+        """
+        params = (lat, long)
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                tornadoes = cur.fetchall()
+
+        if not tornadoes:
+            app.logger.info("No tornado data found")
+            return "No tornado data available", 404
+
+        result = "|".join([
+            f"{int(t[0])}-{int(t[1]):02d}-{int(t[2]):02d}, Mag: {t[3]}, Injuries: {t[4]}, Fatalities: {t[5]}, Loss: ${t[6]:,.2f}"
+            for t in tornadoes
+        ])
+        return result
+
+    except Exception as e:
+        app.logger.error(f"Error in get_tornado_history_based_on_parcel: {str(e)}")
+        return f"An error occurred while processing your request: {str(e)}", 500     
+
+
+@app.route("/fireHistoryBasedOnParcel", methods=['GET'])
+@login_required
+def get_fire_history_based_on_parcel():
+    try:
+        lat = request.args.get("lat1", default=None, type=float)
+        long = request.args.get("long1", default=None, type=float)
+
+        if lat is None or long is None:
+            app.logger.error("Latitude or Longitude is missing")
+            return "Latitude or Longitude is missing", 400
+
+        query = """
+            SELECT DISTINCT ON (acq_date) acq_date, acq_time, latitude, longitude, bright_t31, confidence, frp
+            FROM public.fire_data
+            WHERE longitude BETWEEN %s - 0.8 AND %s + 0.8
+            AND latitude BETWEEN %s - 0.8 AND %s + 0.8
+            AND ST_DWithin(ST_MakePoint(longitude, latitude)::geography, ST_MakePoint(%s, %s)::geography, 50000)
+            AND confidence = %s
+            ORDER BY acq_date DESC, bright_t31 DESC;
+        """
+        params = (long, long, lat, lat, long, lat, 'h')
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                fires = cur.fetchall()
+
+        if not fires:
+            app.logger.info("No fire data found")
+            return "No fire data available", 404
+
+        result = "|".join([
+            f"Date: {fire[0]}, Time: {fire[1]}, Lat: {fire[2]}, Long: {fire[3]}, Brightness: {fire[4]}, Confidence: {fire[5]}, FRP: {fire[6]}"
+            for fire in fires
+        ])
+        return result
+
+    except Exception as e:
+        app.logger.error(f"Error in get_fire_history_based_on_parcel: {str(e)}")
+        return f"An error occurred while processing your request: {str(e)}", 500
+
+@app.route("/hurricaneMarkers", methods=['GET'])
+@login_required
+def get_hurricane_markers():
+    try:
+        season = request.args.get("season", default=None, type=int)
+        number = request.args.get("number", default=None, type=int)
+        basin = request.args.get("basin", default=None, type=str)
+        name = request.args.get("name", default=None, type=str)
+
+        if not (season and number and re.match("^[a-zA-Z]+$", basin) and re.match("^[a-zA-Z_]+$", name)):
+            return "Invalid parameters", 400
+
+        query = """
+            SELECT lat, lon, iso_time, usa_wind, usa_pres, storm_spd
+            FROM hurricanes
+            WHERE season = %s AND number = %s AND basin = %s AND name = %s;
+        """
+        params = (season, number, basin, name)
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                markers = cur.fetchall()
+
+        if not markers:
+            return "No data found", 404
+
+        result = "|".join([
+            f"{marker[0]},{marker[1]},{marker[2]},{marker[3]},{marker[4]},{marker[5]}"
+            for marker in markers
+        ])
+        return result
+
+    except Exception as e:
+        return handle_exception(e)
+
+@app.route("/updateFCMToken", methods=['GET'])
+@login_required
+def update_fcm_token():
+    try:
+        new_token = request.headers.get("newToken")
+        new_instance_id = request.headers.get("newInstanceID")
+
+        if not (new_token and new_instance_id):
+            return "Token or InstanceID not Sent", 400
+
+        plaintext_token = cipher_to_string(new_token)
+        plaintext_id = cipher_to_string(new_instance_id)
+
+        username_hash = hash_username(session['username'])
+
+        query_select = "SELECT app_instanceid FROM public.fcm_tokens WHERE app_instanceid = %s;"
+        query_insert = "INSERT INTO public.fcm_tokens (usernamehash, app_instanceid, fcm_token) VALUES (%s, %s, %s);"
+        query_update = "UPDATE public.fcm_tokens SET usernamehash = %s, fcm_token = %s WHERE app_instanceid = %s;"
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query_select, (plaintext_id,))
+                result = cur.fetchone()
+
+                if result is None:
+                    cur.execute(query_insert, (username_hash, plaintext_id, plaintext_token))
+                else:
+                    cur.execute(query_update, (username_hash, plaintext_token, plaintext_id))
+
+                conn.commit()
+
+        return "Update successful"
+
+    except Exception as e:
+        return f"Could not decode token: {str(e)}", 500
+    
+@app.route("/removeFCMToken", methods=['GET'])
+@login_required
+def remove_fcm_token():
+    try:
+        instance_id = request.headers.get("instanceID")
+
+        if not instance_id:
+            return "InstanceID not Sent", 400
+
+        plaintext_id = cipher_to_string(instance_id)
+
+        query = "DELETE FROM public.fcm_tokens WHERE app_instanceid = %s;"
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (plaintext_id,))
+                conn.commit()
+
+        return "Deletion successful"
+
+    except Exception as e:
+        return f"Could not decode id: {str(e)}", 500
+
+@app.route("/updateNotifSetting", methods=['GET'])
+@login_required
+def update_notif_setting():
+    try:
+        setting_name = request.headers.get("setting")
+        enabled = request.headers.get("enabled")
+
+        if not setting_name or not enabled:
+            return "Setting or enabled status not provided", 400
+
+        column_mapping = {
+            "alert": "notifalert",
+            "earthquake": "notifearthquake",
+            "wildfire": "notifwildfire",
+            "tornado": "notiftornado",
+            "hurricane": "notifhurricane"
+        }
+
+        column = column_mapping.get(setting_name)
+        if not column:
+            return "Setting not updated, incorrect column name", 400
+
+        if enabled == "true":
+            enabled_value = True
+        elif enabled == "false":
+            enabled_value = False
+        else:
+            return "Setting not updated, incorrect boolean", 400
+
+        username_hash = hash_username(session['username'])
+
+        query = f"UPDATE public.users SET {column} = %s WHERE id = %s;"
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (enabled_value, username_hash))
+                conn.commit()
+
+        return "Update successful"
+
+    except Exception as e:
+        return handle_exception(e)
+    
+@app.route("/retrieveNotifSetting", methods=['GET'])
+@login_required
+def retrieve_notif_setting():
+    try:
+        username_hash = hash_username(session['username'])
+
+        query = """
+            SELECT notifalert, notifearthquake, notifwildfire, notiftornado, notifhurricane
+            FROM public.users
+            WHERE id = %s;
+        """
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (username_hash,))
+                result = cur.fetchone()
+
+        if not result:
+            return "empty"
+
+        return ",".join(map(str, result))
+
+    except Exception as e:
+        return handle_exception(e)
+
+@app.route("/addFavorite", methods=['GET'])
+@login_required
+def add_favorite():
+    try:
+        parcel_id = request.headers.get("parcelID")
+        table = request.headers.get("table")
+        nickname = request.headers.get("nickname")
+        center = request.headers.get("center")
+
+        if not (parcel_id and table and nickname and center):
+            return "Favorite not added, missing header values", 400
+
+        if not (re.match(r"^\d+$", parcel_id) and re.match(r"^[\w]+$", table) and re.match(r"^.{1,244}$", nickname) and re.match(r"^lat\/lng: \([\d.-]+,[\d.-]+\)$", center)):
+            return "Favorite not added, incorrect header values", 400
+
+        query_check_existence = f"SELECT objectid FROM public.{table} WHERE objectid = %s;"
+        query_insert_favorite = """
+            INSERT INTO public.favorites (usernamehash, table_id, parcel_id, nickname, center)
+            VALUES (%s, %s, %s, %s, %s);
+        """
+
+        username_hash = hash_username(session['username'])
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query_check_existence, (parcel_id,))
+                exists = cur.fetchone()
+
+                if not exists:
+                    return "Favorite not added, parcel not found in table", 404
+
+                cur.execute(query_insert_favorite, (username_hash, table, parcel_id, nickname, center))
+                conn.commit()
+
+        return "Favorite added successfully"
+
+    except Exception as e:
+        return handle_exception(e)
+
+@app.route("/removeFavorite", methods=['GET'])
+@login_required
+def remove_favorite():
+    try:
+        parcel_id = request.headers.get("parcelID")
+        table = request.headers.get("table")
+
+        if not (parcel_id and table):
+            return "Favorite not removed, missing header values", 400
+
+        if not (re.match(r"^\d+$", parcel_id) and re.match(r"^[\w]+$", table)):
+            return "Favorite not removed, incorrect header values", 400
+
+        username_hash = hash_username(session['username'])
+
+        query = """
+            DELETE FROM public.favorites
+            WHERE userid = %s AND table_id = %s AND parcel_id = %s;
+        """
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (username_hash, table, parcel_id))
+                conn.commit()
+
+        return "Favorite removed successfully"
+
+    except Exception as e:
+        return handle_exception(e)
+
+@app.route("/retrieveFavorites", methods=['GET'])
+@login_required
+def retrieve_favorites():
+    try:
+        username_hash = hash_username(session['username'])
+
+        query = """
+            SELECT table_id, parcel_id, nickname
+            FROM public.favorites
+            WHERE userid = %s;
+        """
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (username_hash,))
+                favorites = cur.fetchall()
+
+        if not favorites:
+            return "No favorites found", 404
+
+        result = "|".join([f"{fav[1]}Ø{fav[0]}|{fav[2]}" for fav in favorites])
+        return result
+
+    except Exception as e:
+        return handle_exception(e)
+
+@login_manager.user_loader
+def load_user(username):
+    try:
+        last_login = session.get('last_login')
+        if last_login and time.time() - last_login < timeout_seconds:
+            return User.get(username)
+        return None
+    except Exception as e:
+        app.logger.error(f"Error loading user: {str(e)}")
+        return None
+
+
