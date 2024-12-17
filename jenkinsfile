@@ -1,0 +1,76 @@
+pipeline {
+    agent {
+        docker {
+            image 'maven:3.8.4-jdk-11'
+            args '-v /var/jenkins_home/.m2:/root/.m2'
+        }
+    }
+	
+	triggers {
+        pollSCM('H/5 * * * *') // Polls the SCM every 5 minutes
+    }
+
+    environment {
+        REPO_URL = 'https://github.com/kinbareid/Project-Portfolio.git'
+        BRANCH = 'main'
+    }
+
+    stages {
+	
+		stage('Checkout') {
+            steps {
+                // Checkout code from the SCM repository
+                checkout scm
+            }
+        }
+		
+        stage('Clone Repository') {
+            steps {
+                echo 'Cloning repository...'
+                git branch: "${BRANCH}", url: "${REPO_URL}"
+            }
+        }
+
+        stage('Build') {
+            steps {
+                echo 'Building project...'
+                sh 'mvn clean install'
+            }
+        }
+
+        stage('Test') {
+            steps {
+                echo 'Running tests...'
+                sh 'mvn test'
+            }
+        }
+
+        stage('Package') {
+            steps {
+                echo 'Packaging application...'
+                sh 'mvn package'
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                echo 'Deploying application...'
+                // Replace with your actual deployment steps
+                sh 'scp target/your-artifact.jar user@server:/path/to/deploy'
+            }
+        }
+    }
+
+    post {
+    always {
+        echo 'Cleaning up workspace...'
+        deleteDir()
+    }
+    success {
+        echo 'Pipeline completed successfully!'
+    }
+    failure {
+        echo 'Pipeline failed!'
+    }
+}
+}
